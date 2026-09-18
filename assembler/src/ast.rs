@@ -11,6 +11,7 @@ pub enum ASTNode {
     Section(String),
     Global(String),
     Extern(String),
+    Const { name: String, expr: ExprValue },
 }
 
 #[derive(Debug, Clone)]
@@ -27,9 +28,14 @@ pub struct Directive {
 
 #[derive(Debug, Clone)]
 pub enum DirectiveValue {
-    Number(i64),
+    Expr(ExprValue),
     StringLiteral(String),
-    Identifier(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprValue {
+    Number(i64),
+    Symbol { name: String, addend: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +43,7 @@ pub enum Operand {
     Register(String),
     Immediate(i64),
     Label(String),
+    SymbolExpr { name: String, addend: i64 },
     Memory(MemoryOperand)
 }
 
@@ -46,4 +53,5 @@ pub struct MemoryOperand {
     pub index: Option<String>,
     pub scale: u8,
     pub disp: i64,
+    pub symbol: Option<String>,
 }

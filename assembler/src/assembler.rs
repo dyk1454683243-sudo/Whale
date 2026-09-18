@@ -32,12 +32,13 @@ pub struct Relocation {
 #[derive(Debug, Clone)]
 pub enum RelocKind {
     Absolute64,
+    Absolute32,
     Relative32,
+    Relative8,
 }
 
 pub fn assemble(source: &str, isa: &impl ISA) -> Result<AssemblerOutput, AsmError> {
-    let tokens = tokenize(source)
-        .map_err(|e| AsmError::LexerError(e.to_string()))?;
+    let tokens = tokenize(source)?;
 
     let ast: AST = isa.parse(&tokens)?;
 

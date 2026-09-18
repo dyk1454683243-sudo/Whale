@@ -2,11 +2,14 @@ use std::fs;
 use std::process;
 use std::time::Instant;
 
-use assembler::{assemble, isa::AMD64, AssemblerOutput};
 use assembler::isa::amd64::parser::parse;
 use assembler::tokens::tokenize;
+use assembler::{assemble, isa::AMD64, AssemblerOutput};
 
-use object::{ObjectFile, ObjectFormat, SectionKind};
+use object::{
+    ObjectFile, ObjectFormat, ObjectRelocation, ObjectSymbol, RelocKind as ObjectRelocKind,
+    SectionKind, SymbolBinding, SymbolVisibility,
+};
 
 pub fn run(args: Vec<String>) {
     if args.is_empty() {
@@ -104,8 +107,13 @@ pub fn run(args: Vec<String>) {
 
     let need_tokens = debug_mode && (show_token || show_ast || show_stats);
     if need_tokens {
-        if trace_enable { println!("[trace] tokenize start"); }
-        let tokens = tokenize(&src).expect("Tokenize error");
+        if trace_enable {
+            println!("[trace] tokenize start");
+        }
+        let tokens = tokenize(&src).unwrap_or_else(|e| {
+            eprintln!("Tokenize error: {}", e);
+            process::exit(1);
+        });
         token_len = Some(tokens.len());
 
         if show_token {
@@ -113,8 +121,13 @@ pub fn run(args: Vec<String>) {
         }
 
         if show_ast || show_stats {
-            if trace_enable { println!("[trace] parse start"); }
-            let ast = parse(&tokens).expect("Parse error");
+            if trace_enable {
+                println!("[trace] parse start");
+            }
+            let ast = parse(&tokens).unwrap_or_else(|e| {
+                eprintln!("Parse error: {}", e);
+                process::exit(1);
+            });
             ast_items_len = Some(ast.items.len());
 
             if show_ast {
@@ -123,13 +136,23 @@ pub fn run(args: Vec<String>) {
         }
     }
 
-    if trace_enable { println!("[trace] assemble start"); }
+    if trace_enable {
+        println!("[trace] assemble start");
+    }
     let start_time = Instant::now();
-    let out = assemble(&src, &AMD64).expect("Assemble error");
+    let out = assemble(&src, &AMD64).unwrap_or_else(|e| {
+        eprintln!("Assemble error: {}", e);
+        process::exit(1);
+    });
     let elapsed = start_time.elapsed();
 
-    if trace_enable { println!("[trace] creating object file"); }
-    let final_bytes = build_elf_from_asm_output(&out);
+    if trace_enable {
+        println!("[trace] creating object file");
+    }
+    let final_bytes = build_elf_from_asm_output(&out).unwrap_or_else(|e| {
+        eprintln!("ELF build error: {}", e);
+        process::exit(1);
+    });
 
     fs::write(&output, &final_bytes).unwrap_or_else(|e| {
         eprintln!("Failed to write {}: {}", output, e);
@@ -137,7 +160,14 @@ pub fn run(args: Vec<String>) {
     });
 
     if debug_mode && (show_bytes || dump_hex || dump_bin || dump_json) {
-        dump_bytes("object", &final_bytes, show_bytes, dump_hex, dump_bin, dump_json);
+        dump_bytes(
+            "object",
+            &final_bytes,
+            show_bytes,
+            dump_hex,
+            dump_bin,
+            dump_json,
+        );
     }
 
     if debug_mode && show_stats {
@@ -153,11 +183,10 @@ pub fn run(args: Vec<String>) {
     println!("Wrote {} bytes to {}", final_bytes.len(), output);
 }
 
-fn build_elf_from_asm_output(out: &AssemblerOutput) -> Vec<u8> {
+fn build_elf_from_asm_output(out: &AssemblerOutput) -> Result<Vec<u8>, String> {
     let mut obj = ObjectFile::new(ObjectFormat::ELF64);
+    let mut section_map = Vec::with_capacity(out.sections.len());
 
-    // AssemblerOutput의 sections를 그대로 ELF 섹션으로 옮김
-    // (심볼/리로케이션 매핑은 out.symbols/out.relocs 구조 확정되면 다음 단계에서 붙이는 게 맞음)
     for sec in &out.sections {
         let kind = match sec.name.as_str() {
             ".text" => SectionKind::Text,
@@ -170,18 +199,97 @@ fn build_elf_from_asm_output(out: &AssemblerOutput) -> Vec<u8> {
         let align = if sec.name == ".text" { 16 } else { 1 };
         let idx = obj.add_section(&sec.name, kind, align);
         obj.sections[idx].data = sec.data.clone();
+        section_map.push(idx);
     }
 
-    obj.write().expect("Failed to create ELF object")
+    for sym in &out.symbols {
+        let section_index = sym
+            .section_index
+            .and_then(|idx| section_map.get(idx).copied());
+
+        obj.symbols.push(ObjectSymbol {
+            name: sym.name.clone(),
+            section_index,
+            value: sym.offset as u64,
+            size: 0,
+            binding: if sym.is_global {
+                SymbolBinding::Global
+            } else {
+                SymbolBinding::Local
+            },
+            visibility: SymbolVisibility::Default,
+        });
+    }
+
+    for (asm_sec_idx, sec) in out.sections.iter().enumerate() {
+        let Some(&obj_sec_idx) = section_map.get(asm_sec_idx) else {
+            continue;
+        };
+
+        for reloc in &sec.relocs {
+            let is_undefined_symbol = out
+                .symbols
+                .iter()
+                .find(|s| s.name == reloc.symbol)
+                .map(|s| s.section_index.is_none())
+                .unwrap_or(true);
+
+            let kind = match reloc.kind {
+                assembler::assembler::RelocKind::Absolute64 => ObjectRelocKind::Absolute64,
+                assembler::assembler::RelocKind::Absolute32 => ObjectRelocKind::Absolute32,
+                assembler::assembler::RelocKind::Relative32 => {
+                    if is_undefined_symbol {
+                        ObjectRelocKind::PLT32
+                    } else {
+                        ObjectRelocKind::Relative32
+                    }
+                }
+                assembler::assembler::RelocKind::Relative8 => ObjectRelocKind::Relative8,
+            };
+
+            obj.relocations.push(ObjectRelocation {
+                section_index: obj_sec_idx,
+                offset: reloc.offset,
+                symbol: reloc.symbol.clone(),
+                addend: reloc.addend,
+                kind,
+            });
+
+            if obj.symbols.iter().all(|s| s.name != reloc.symbol) {
+                obj.symbols.push(ObjectSymbol {
+                    name: reloc.symbol.clone(),
+                    section_index: None,
+                    value: 0,
+                    size: 0,
+                    binding: SymbolBinding::Global,
+                    visibility: SymbolVisibility::Default,
+                });
+            }
+        }
+    }
+
+    obj.write()
 }
 
-fn dump_bytes(label: &str, bytes: &[u8], show_bytes: bool, dump_hex: bool, dump_bin: bool, dump_json: bool) {
+fn dump_bytes(
+    label: &str,
+    bytes: &[u8],
+    show_bytes: bool,
+    dump_hex: bool,
+    dump_bin: bool,
+    dump_json: bool,
+) {
     const LIMIT: usize = 256;
     let n = bytes.len().min(LIMIT);
     let head = &bytes[..n];
 
     if show_bytes {
-        println!("== BYTES ({}, {} bytes, head {} bytes) ==", label, bytes.len(), n);
+        println!(
+            "== BYTES ({}, {} bytes, head {} bytes) ==",
+            label,
+            bytes.len(),
+            n
+        );
         for (i, b) in head.iter().enumerate() {
             println!("{:04X}: {}", i, b);
         }
@@ -211,7 +319,9 @@ fn dump_bytes(label: &str, bytes: &[u8], show_bytes: bool, dump_hex: bool, dump_
         println!("  \"len\": {},", bytes.len());
         print!("  \"head\": [");
         for (i, b) in head.iter().enumerate() {
-            if i != 0 { print!(", "); }
+            if i != 0 {
+                print!(", ");
+            }
             print!("{}", b);
         }
         println!("]");

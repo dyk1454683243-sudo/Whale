@@ -29,82 +29,128 @@ fn reg_code(name: &str, mode: u8) -> Option<u8> {
     regs.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
 
-/// Encodes x86-64 memory operand
-///
-/// Supports:
-/// - [base]
-/// - [base + disp8]
-/// - [base + disp32]
-/// - special case [rbp], [rbp + 0]
-/// - automatic REX.B
-///
-/// Does NOT (yet) support:
-/// - index register
-/// - scale factor
-/// - sib addressing
-pub fn encode_address(mem: &MemoryOperand, mode: u8) -> Result<EncodedAddress, AsmError> {
-    let base = mem.base.as_deref();
-    let index = mem.index.as_deref();
-    let scale = mem.scale;
-    let disp = mem.disp;
+fn scale_bits(scale: u8) -> Option<u8> {
+    match scale {
+        1 => Some(0),
+        2 => Some(1),
+        4 => Some(2),
+        8 => Some(3),
+        _ => None,
+    }
+}
 
-    if index.is_some() {
+pub fn encode_address(mem: &MemoryOperand, mode: u8) -> Result<EncodedAddress, AsmError> {
+    if mem.symbol.is_some() {
         return Err(AsmError::EncodeError(
-            "index-based addressing not implemented yet (A-Step)".into(),
+            "symbol memory should be encoded via rip-relative path".into(),
         ));
     }
 
-    if let Some(base_reg) = base {
-        let base_code =
-            reg_code(base_reg, mode).ok_or_else(|| AsmError::EncodeError("Invalid base register".into()))?;
+    let base_code = mem
+        .base
+        .as_deref()
+        .map(|b| reg_code(b, mode).ok_or_else(|| AsmError::EncodeError("Invalid base register".into())))
+        .transpose()?;
+    let index_code = mem
+        .index
+        .as_deref()
+        .map(|i| reg_code(i, mode).ok_or_else(|| AsmError::EncodeError("Invalid index register".into())))
+        .transpose()?;
 
-        let rex_b = base_code > 7; // REX.B = high registers (r8–r15)
-        let rm = base_code & 7;
-
-        if base_reg == "rbp" && disp == 0 {
-            return Ok(EncodedAddress {
-                mod_bits: 1,      // 01b = disp8
-                rm_bits: rm,
-                sib: None,
-                disp: Some(DispKind::Disp8(0)),
-                rex_b,
-                rex_x: false,
-            });
-        }
-
-        if disp == 0 {
-            return Ok(EncodedAddress {
-                mod_bits: 0,      // 00b
-                rm_bits: rm,
-                sib: None,
-                disp: None,
-                rex_b,
-                rex_x: false,
-            });
-        }
-
-        if (-128..=127).contains(&disp) {
-            return Ok(EncodedAddress {
-                mod_bits: 1,  // 01b
-                rm_bits: rm,
-                sib: None,
-                disp: Some(DispKind::Disp8(disp as i8)),
-                rex_b,
-                rex_x: false,
-            });
-        }
-
-        return Ok(EncodedAddress {
-            mod_bits: 2, // 10b
-            rm_bits: rm,
-            sib: None,
-            disp: Some(DispKind::Disp32(disp as i32)),
-            rex_b,
-            rex_x: false,
-        });
+    if base_code.is_none() && index_code.is_none() {
+        return Err(AsmError::EncodeError(
+            "Addressing without base/index not implemented".into(),
+        ));
     }
 
-    Err(AsmError::EncodeError(
-        "Addressing without base register not implemented yet".into(),
-    ))
+    let scale = scale_bits(mem.scale)
+        .ok_or_else(|| AsmError::EncodeError("Scale must be 1/2/4/8".into()))?;
+
+    if let Some(idx) = index_code {
+        if (idx & 7) == 4 {
+            return Err(AsmError::EncodeError(
+                "rsp/r12 cannot be used as index register".into(),
+            ));
+        }
+    }
+
+    let disp = mem.disp;
+    let disp_kind = if disp == 0 {
+        None
+    } else if (-128..=127).contains(&disp) {
+        Some(DispKind::Disp8(disp as i8))
+    } else {
+        Some(DispKind::Disp32(disp as i32))
+    };
+
+    let need_sib = index_code.is_some() || base_code.is_none() || base_code.map(|b| (b & 7) == 4).unwrap_or(false);
+
+    let (mod_bits, final_disp, rm_bits, sib, rex_b, rex_x) = match (base_code, index_code, need_sib) {
+        (Some(base), idx, true) => {
+            let base_low = base & 7;
+            let mut mod_bits = 0;
+            let mut disp = disp_kind;
+
+            if base_low == 5 && disp.is_none() {
+                mod_bits = 1;
+                disp = Some(DispKind::Disp8(0));
+            } else if matches!(disp, Some(DispKind::Disp8(_))) {
+                mod_bits = 1;
+            } else if matches!(disp, Some(DispKind::Disp32(_))) {
+                mod_bits = 2;
+            }
+
+            let index_low = idx.map(|i| i & 7).unwrap_or(4);
+            let base_low = base & 7;
+            (
+                mod_bits,
+                disp,
+                4,
+                Some((scale, index_low, base_low)),
+                base >= 8,
+                idx.map(|i| i >= 8).unwrap_or(false),
+            )
+        }
+        (Some(base), _, false) => {
+            let base_low = base & 7;
+            let mut mod_bits = 0;
+            let mut disp = disp_kind;
+
+            if base_low == 5 && disp.is_none() {
+                mod_bits = 1;
+                disp = Some(DispKind::Disp8(0));
+            } else if matches!(disp, Some(DispKind::Disp8(_))) {
+                mod_bits = 1;
+            } else if matches!(disp, Some(DispKind::Disp32(_))) {
+                mod_bits = 2;
+            }
+
+            (mod_bits, disp, base_low, None, base >= 8, false)
+        }
+        (None, Some(idx), _) => {
+            let index_low = idx & 7;
+            (
+                0,
+                Some(DispKind::Disp32(disp as i32)),
+                4,
+                Some((scale, index_low, 5)),
+                false,
+                idx >= 8,
+            )
+        }
+        _ => {
+            return Err(AsmError::EncodeError(
+                "Addressing mode is not supported yet".into(),
+            ))
+        }
+    };
+
+    Ok(EncodedAddress {
+        mod_bits,
+        rm_bits,
+        sib,
+        disp: final_disp,
+        rex_b,
+        rex_x,
+    })
 }

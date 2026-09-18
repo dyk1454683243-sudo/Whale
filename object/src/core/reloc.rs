@@ -1,7 +1,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocKind {
     Absolute64,
+    Absolute32,
     Relative32,
+    Relative8,
     GOTPCREL,
     PLT32,
 }
